@@ -96,6 +96,14 @@ class StableDiffusionXLTangentialDecomposedPipeline(StableDiffusionXLPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
 
+        ## Repregentation Guidance specific parameters
+        f_phi: Callable[[torch.Tensor], torch.Tensor] = None,  # Feature extractor
+        V: torch.Tensor = None,  # Representative vectors
+        c: int = 0,  # Class label for which to apply RepG
+        rep_guidance_scale: float = 1.0,  # Scale for RepG
+        distance_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        ################################################
+
         ## Tangential Scailing Guidance specific parameters
         t_guidance_scale: float = 1.0,  # Scale for TGS
         r_guidance_scale: float = 1.0,  # Scale for radial guidance
@@ -103,6 +111,8 @@ class StableDiffusionXLTangentialDecomposedPipeline(StableDiffusionXLPipeline):
         ## Apply range for each scaling
         sta_tpd: int = 1000,  # Start step for tangential scaling
         end_tpd: int = 0,  # End step for tangential scaling
+        # r_start_step: int = 999,  # Start step for radial scaling
+        # r_end_step: int = 0,  # End step for radial scaling
 
         **kwargs: Any,  # Additional arguments for future compatibility
     ):

@@ -24,7 +24,6 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
     EXAMPLE_DOC_STRING
 )
 
-# 1. StableDiffusionPipeline을 상속받는 새로운 클래스 정의
 class StableDiffusionTangentialDecomposedPipeline(StableDiffusionPipeline):
 
     @torch.no_grad()
@@ -357,13 +356,6 @@ class StableDiffusionTangentialDecomposedPipeline(StableDiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
-
-
-
-
-
-
-
 
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[

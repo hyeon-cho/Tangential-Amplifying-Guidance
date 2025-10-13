@@ -1,0 +1,28 @@
+generation:
+  prompt: ""
+  seed: 10838
+  cfg_scale: 0.0
+  t_lr: 1.0
+  r_lr: 1.0
+  n_steps: 50
+
+pipeline:
+  sd_version: "2.1"       
+  scheduler: null         
+  enable_xformers: false
+
+io:
+  root: ""
+  subdir_tgs_disabled: "without_TAG"
+  subdir_tgs_enabled: "with_TAG"
+  filename_style: "smart" 
+
+keep_cwd: true
+log_level: "INFO"
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
