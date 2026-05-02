@@ -1,4 +1,4 @@
-# TAG: Tangential Amplifying Guidance for Hallucination-Resistant Diffusion Sampling
+# [ICML2026] TAG: Tangential Amplifying Guidance for Hallucination-Resistant Diffusion Sampling
 <a href="https://arxiv.org/abs/2510.04533"><img src="https://img.shields.io/badge/arXiv-2510.04533-%23B31B1B"></a>
 <a href="https://hyeon-cho.github.io/TAG/"><img src="https://img.shields.io/badge/Project%20Page-online-brightgreen"></a>  
 <br>
