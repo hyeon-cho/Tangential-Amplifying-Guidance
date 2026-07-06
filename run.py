@@ -1,9 +1,13 @@
-# main.py
+"""Hydra entry point for TAG text-to-image generation.
+
+Usage:
+    python run.py --config-name sd1     # (or sd2 / sd3 / sdxl, see conf/)
+"""
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Literal, Tuple
 from pathlib import Path
 
@@ -55,9 +59,9 @@ class IOCfg:
 
 @dataclass
 class AppCfg:
-    generation: GenerationCfg = GenerationCfg()
-    pipeline: PipelineCfg = PipelineCfg()
-    io: IOCfg = IOCfg()
+    generation: GenerationCfg = field(default_factory=GenerationCfg)
+    pipeline: PipelineCfg = field(default_factory=PipelineCfg)
+    io: IOCfg = field(default_factory=IOCfg)
     keep_cwd: bool = True
     log_level: Literal["INFO", "DEBUG", "WARNING"] = "INFO"
 
@@ -105,9 +109,7 @@ def apply_scheduler(name: Optional[SchedulerName], pipe) -> None:
         raise ValueError(f"Unsupported scheduler: {name}")
 
 def default_size(sd_version: SDVersion) -> Tuple[int, int]:
-    """
-    sd_version별 기본 해상도 반환(정보 목적으로만).
-    """
+    """Default resolution per SD version (informational only)."""
     return {
         "1.5": (512, 512),
         "2.1": (768, 768),
@@ -135,12 +137,13 @@ def resolve_save_path(
     subdir_when_tgs_disabled: str = "without_TAG",
     subdir_when_tgs_enabled: str = "with_TAG",
 ) -> Path:
-    """
-    - root == "" for current working directory
-    - (t_lr, r_lr) == (1.0, 1.0) → 
-    - filename_style:
-        - "legacy"  
-        - "smart"  
+    """Build the output path for a generated image.
+
+    - `root == ""` saves under the current working directory.
+    - Runs with `(t_lr, r_lr) == (1.0, 1.0)` (TAG disabled) go to
+      `subdir_when_tgs_disabled`, everything else to `subdir_when_tgs_enabled`.
+    - `filename_style`: "smart" encodes model/prompt/scales/seed in the filename;
+      "legacy" always writes `legacy.png`.
     """
     base = Path(root).expanduser().resolve() if root.strip() else Path.cwd()
     sub = subdir_when_tgs_disabled if (gen.t_lr == 1.0 and gen.r_lr == 1.0) else subdir_when_tgs_enabled

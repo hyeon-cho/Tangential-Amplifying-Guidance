@@ -1,59 +1,29 @@
-from diffusers import StableDiffusionXLPipeline
-
-import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-from transformers import (
-    CLIPImageProcessor,
-    CLIPTextModel,
-    CLIPTextModelWithProjection,
-    CLIPTokenizer,
-    CLIPVisionModelWithProjection,
-)
 
+from diffusers import StableDiffusionXLPipeline
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
-from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
-from diffusers.loaders import (
-    FromSingleFileMixin,
-    IPAdapterMixin,
-    StableDiffusionXLLoraLoaderMixin,
-    TextualInversionLoaderMixin,
-)
-from diffusers.models import AutoencoderKL, ImageProjection, UNet2DConditionModel
-from diffusers.models.attention_processor import (
-    AttnProcessor2_0,
-    FusedAttnProcessor2_0,
-    LoRAAttnProcessor2_0,
-    LoRAXFormersAttnProcessor,
-    XFormersAttnProcessor,
-)
-from diffusers.models.lora import adjust_lora_scale_text_encoder
-from diffusers.schedulers import KarrasDiffusionSchedulers
-from diffusers.utils import (
-    USE_PEFT_BACKEND,
-    deprecate,
-    is_invisible_watermark_available,
-    is_torch_xla_available,
-    logging,
-    replace_example_docstring,
-    scale_lora_layers,
-    unscale_lora_layers,
-)
-from diffusers.utils.torch_utils import randn_tensor
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusionMixin
+from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
-
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import (
-    is_invisible_watermark_available,
-    is_torch_xla_available,
-    logger, 
-    EXAMPLE_DOC_STRING, 
-    rescale_noise_cfg, 
-    retrieve_timesteps
+    EXAMPLE_DOC_STRING,
+    rescale_noise_cfg,
+    retrieve_timesteps,
 )
+from diffusers.utils import deprecate, replace_example_docstring
+
 
 class StableDiffusionXL_CTAGPipeline(StableDiffusionXLPipeline):
+    """SDXL pipeline with Conditional TAG (classifier-free-guidance-aware TAG).
+
+    Instead of re-scaling the sampler update, Conditional TAG operates in score
+    space: the conditional/unconditional predictions are converted to scores, the
+    guidance direction is decomposed around the radial axis of the current latent,
+    and the component of the conditional score aligned with the tangential guidance
+    difference is amplified by `t_guidance_scale` before being folded back into the
+    scheduler's prediction type.
+    """
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -96,25 +66,12 @@ class StableDiffusionXL_CTAGPipeline(StableDiffusionXLPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
 
-        ## Repregentation Guidance specific parameters
-        f_phi: Callable[[torch.Tensor], torch.Tensor] = None,  # Feature extractor
-        V: torch.Tensor = None,  # Representative vectors
-        c: int = 0,  # Class label for which to apply RepG
-        rep_guidance_scale: float = 1.0,  # Scale for RepG
-        distance_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
-        ################################################
-
-        ## Tangential Scailing Guidance specific parameters
-        t_guidance_scale: float = 1.0,  # Scale for TGS
-        r_guidance_scale: float = 1.0,  # Scale for radial guidance
-
-        ## Apply range for each scaling
-        sta_tpd: int = 1000,  # Start step for tangential scaling
-        end_tpd: int = 0,  # End step for tangential scaling
-        # r_start_step: int = 999,  # Start step for radial scaling
-        # r_end_step: int = 0,  # End step for radial scaling
-
-        **kwargs: Any,  # Additional arguments for future compatibility
+        # --- Conditional TAG parameters ---
+        t_guidance_scale: float = 1.0,  # eta in Eq. (26): gain on the aligned tangential component
+        r_guidance_scale: float = 1.0,  # unused in Conditional TAG; kept for API symmetry
+        sta_tpd: int = 1000,  # Conditional TAG is active for timesteps t < sta_tpd
+        end_tpd: int = 0,     # ... and t >= end_tpd
+        **kwargs: Any,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -252,6 +209,13 @@ class StableDiffusionXL_CTAGPipeline(StableDiffusionXLPipeline):
                 The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeline class.
+            t_guidance_scale (`float`, *optional*, defaults to 1.0):
+                Gain `eta` on the aligned tangential guidance component, applied independently of
+                `guidance_scale` as in Eq. (26) of the paper (`0.0` recovers plain CFG).
+            sta_tpd (`int`, *optional*, defaults to 1000):
+                Upper end of the timestep window in which Conditional TAG is applied (`end_tpd <= t < sta_tpd`).
+            end_tpd (`int`, *optional*, defaults to 0):
+                Lower end of the timestep window in which Conditional TAG is applied.
 
         Examples:
 
@@ -463,108 +427,79 @@ class StableDiffusionXL_CTAGPipeline(StableDiffusionXLPipeline):
                     return_dict=False,
                 )[0]
 
-                # perform guidance
+                # perform guidance (Conditional TAG replaces the plain CFG merge)
                 if self.do_classifier_free_guidance:
-                    # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    # noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                    # 2. Split immediately (Assuming we always use CFG as you stated)
                     eps_uncond_raw, eps_text_raw = noise_pred.chunk(2)
-
                     eps_u = eps_uncond_raw
                     eps_c = eps_text_raw
 
-                    # --- [Algorithm 2: TAG (Tangential Amplifying Guidance)] ---
-                    # Now we have (potentially TCFG-filtered) eps_u and original eps_c.
-                    # We proceed to calculate the final merged output using TAG logic.
-
-                    # A) Setup Scalars
+                    # 1) DDPM quantities for the current timestep
                     t_idx = int(t) if not isinstance(t, torch.Tensor) else int(t.item())
                     alpha_prod_t = self.scheduler.alphas_cumprod[t_idx]
-                    beta_prod_t  = 1.0 - alpha_prod_t
-                    sqrt_alpha   = alpha_prod_t**0.5
-                    sqrt_beta    = beta_prod_t**0.5
-                    sigma_t      = sqrt_beta 
+                    beta_prod_t = 1.0 - alpha_prod_t
+                    sqrt_alpha = alpha_prod_t**0.5
+                    sqrt_beta = beta_prod_t**0.5
+                    sigma_t = sqrt_beta
 
-                    # B) Convert Model Output (Epsilon/V/Sample) -> Score
+                    # 2) convert the model outputs to epsilon parameterization
                     pt = self.scheduler.config.prediction_type
-
                     if pt == "epsilon":
-                        # eps_u and eps_c are already epsilons
-                        pass 
-                    elif pt == "sample":  
-                        # Model output is x0, convert to epsilon for score calc
-                        # eps = (latents - sqrt_alpha * x0) / sqrt_beta
+                        pass
+                    elif pt == "sample":  # model predicts x0: eps = (x_t - sqrt_alpha * x0) / sqrt_beta
                         x0_u, x0_c = eps_u, eps_c
                         eps_u = (latents - sqrt_alpha * x0_u) / (sqrt_beta + 1e-12)
                         eps_c = (latents - sqrt_alpha * x0_c) / (sqrt_beta + 1e-12)
-                    elif pt == "v_prediction":
-                        # Model output is v, convert to epsilon
-                        # eps = sqrt_alpha * v + sqrt_beta * latents
+                    elif pt == "v_prediction":  # eps = sqrt_alpha * v + sqrt_beta * x_t
                         v_u, v_c = eps_u, eps_c
                         eps_u = sqrt_alpha * v_u + sqrt_beta * latents
                         eps_c = sqrt_alpha * v_c + sqrt_beta * latents
                     else:
                         raise ValueError(f"Unsupported prediction_type: {pt}")
 
-                    # C) Convert Epsilon -> Score
-                    # Score s = -epsilon / sigma
+                    # 3) epsilon -> score: s = -eps / sigma
                     s_u = -eps_u / (sigma_t + 1e-12)
                     s_c = -eps_c / (sigma_t + 1e-12)
 
-                    # D) TAG Geometric Projections
-                    # Normalize Latent
-                    n_latent = latents / (latents.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
+                    # 4) geometric decomposition around the radial axis of x_t
+                    n_latent = latents / (latents.norm(p=2, dim=(1, 2, 3), keepdim=True) + 1e-8)
 
-                    def Ppar(z, n): 
-                        """Radial projector"""
-                        return (z * n).sum(dim=(1,2,3), keepdim=True) * n
+                    def radial_proj(z, n):
+                        """Projection of z onto the (unit) radial direction n."""
+                        return (z * n).sum(dim=(1, 2, 3), keepdim=True) * n
 
                     def proj(z, on_to):
-                        """Projection of z onto vector 'on_to'"""
-                        n = on_to / (on_to.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
-                        return (z * n).sum(dim=(1,2,3), keepdim=True) * n
+                        """Projection of z onto the direction of `on_to`."""
+                        n = on_to / (on_to.norm(p=2, dim=(1, 2, 3), keepdim=True) + 1e-8)
+                        return (z * n).sum(dim=(1, 2, 3), keepdim=True) * n
 
-                    # TAG Step 1: Standard Guidance Direction
-                    g = s_c - s_u
+                    g = s_c - s_u  # standard CFG guidance direction
 
-                    # TAG Step 2: Decompose into Radial (n) and Tangential (t)
-                    n_c = Ppar(s_c, n=n_latent)
-                    n_u = Ppar(s_u, n=n_latent)
-                    t_c = s_c - n_c
-                    t_u = s_u - n_u
+                    t_c = s_c - radial_proj(s_c, n=n_latent)  # tangential parts
+                    t_u = s_u - radial_proj(s_u, n=n_latent)
 
-                    # TAG Step 3: Alignment Component
-                    # Project s_c onto the difference in tangential components
+                    # aligned component: projection of s_c onto the tangential
+                    # guidance difference (t_c - t_u)
                     g_aligned = proj(s_c, on_to=t_c - t_u)
 
-                    # TAG Step 4: Augmented Guidance
-                    # Note: Ensure t_guidance_scale is defined in your scope
-                    # import pdb; pdb.set_trace()
-                    if t.item() < sta_tpd and t.item() >= end_tpd:
-                        pass
-                    else: 
+                    # 5) amplify the aligned component inside the timestep window.
+                    # Outside the window the gain is set to 0 (and stays 0 for the
+                    # remaining steps, since timesteps are monotonically decreasing).
+                    if not (t.item() < sta_tpd and t.item() >= end_tpd):
                         t_guidance_scale = 0.0
-                    g_augmented = g + t_guidance_scale * g_aligned
 
-                    # TAG Step 5: Final Combined Score
-                    s_star = s_u + self.guidance_scale * g_augmented
+                    # eps~ = eps_u + omega * g + eta * g_align  (paper Eq. 26, in score
+                    # space): eta = t_guidance_scale is independent of the CFG scale.
+                    s_star = s_u + self.guidance_scale * g + t_guidance_scale * g_aligned
 
-                    # --- [Finalizing: Score -> Model Output] ---
-
-                    # Convert Final Score -> Final Epsilon
+                    # 6) score -> epsilon -> the scheduler's prediction type
                     eps_final = -sigma_t * s_star
-
-                    # Convert Final Epsilon -> Scheduler Input (Model Output)
                     if pt == "epsilon":
                         model_out = eps_final
-                    elif pt == "sample": 
-                        # x0 = (latents - sqrt_beta * eps) / sqrt_alpha
+                    elif pt == "sample":  # x0 = (x_t - sqrt_beta * eps) / sqrt_alpha
                         model_out = (latents - sqrt_beta * eps_final) / (sqrt_alpha + 1e-12)
-                    elif pt == "v_prediction":
-                        # v = (eps - sqrt_beta * latents) / sqrt_alpha
+                    elif pt == "v_prediction":  # v = (eps - sqrt_beta * x_t) / sqrt_alpha
                         model_out = (eps_final - sqrt_beta * latents) / (sqrt_alpha + 1e-12)
-                noise_pred = model_out
+                    noise_pred = model_out
 
                 if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
@@ -572,11 +507,8 @@ class StableDiffusionXL_CTAGPipeline(StableDiffusionXLPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
-
-                # [NOTE] Apply the Tangential Scaling Guidance
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
-                # [NOTE] Apple MPS Bug -- Don't need to care 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
@@ -604,10 +536,6 @@ class StableDiffusionXL_CTAGPipeline(StableDiffusionXLPipeline):
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
-
-                # [NOTE] Disabled XLA (TPU) support for now 
-                # if XLA_AVAILABLE:
-                #     xm.mark_step()
 
         if not output_type == "latent":
             # make sure the VAE is in float32 mode, as it overflows in float16

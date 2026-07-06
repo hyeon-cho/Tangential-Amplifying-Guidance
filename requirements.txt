@@ -1,0 +1,16 @@
+# Core dependencies. Tested with diffusers 0.35.1 / torch 2.7, Python 3.10.
+# Install torch first, matching your CUDA version, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1
+diffusers>=0.33,<0.36
+transformers>=4.44
+accelerate
+safetensors
+sentencepiece   # SD3 text encoder tokenizer
+protobuf
+hydra-core>=1.3
+omegaconf
+Pillow
+
+# Optional: demo notebook (demo_conditional_generation.ipynb)
+matplotlib

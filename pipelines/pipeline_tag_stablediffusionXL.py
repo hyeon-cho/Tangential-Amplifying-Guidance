@@ -1,59 +1,27 @@
-from diffusers import StableDiffusionXLPipeline
-
-import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-from transformers import (
-    CLIPImageProcessor,
-    CLIPTextModel,
-    CLIPTextModelWithProjection,
-    CLIPTokenizer,
-    CLIPVisionModelWithProjection,
-)
 
+from diffusers import StableDiffusionXLPipeline
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
-from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
-from diffusers.loaders import (
-    FromSingleFileMixin,
-    IPAdapterMixin,
-    StableDiffusionXLLoraLoaderMixin,
-    TextualInversionLoaderMixin,
-)
-from diffusers.models import AutoencoderKL, ImageProjection, UNet2DConditionModel
-from diffusers.models.attention_processor import (
-    AttnProcessor2_0,
-    FusedAttnProcessor2_0,
-    LoRAAttnProcessor2_0,
-    LoRAXFormersAttnProcessor,
-    XFormersAttnProcessor,
-)
-from diffusers.models.lora import adjust_lora_scale_text_encoder
-from diffusers.schedulers import KarrasDiffusionSchedulers
-from diffusers.utils import (
-    USE_PEFT_BACKEND,
-    deprecate,
-    is_invisible_watermark_available,
-    is_torch_xla_available,
-    logging,
-    replace_example_docstring,
-    scale_lora_layers,
-    unscale_lora_layers,
-)
-from diffusers.utils.torch_utils import randn_tensor
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusionMixin
+from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
-
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import (
-    is_invisible_watermark_available,
-    is_torch_xla_available,
-    logger, 
-    EXAMPLE_DOC_STRING, 
-    rescale_noise_cfg, 
-    retrieve_timesteps
+    EXAMPLE_DOC_STRING,
+    rescale_noise_cfg,
+    retrieve_timesteps,
 )
+from diffusers.utils import deprecate, replace_example_docstring
+
 
 class StableDiffusionXLTangentialDecomposedPipeline(StableDiffusionXLPipeline):
+    """SDXL pipeline with Tangential Amplifying Guidance (TAG).
+
+    At every sampling step the scheduler update `delta = x_{t-1} - x_t` is decomposed
+    into its radial component (along the current latent direction) and the tangential
+    remainder; the two components are re-scaled independently by `r_guidance_scale`
+    and `t_guidance_scale` before being applied.
+    """
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -96,25 +64,12 @@ class StableDiffusionXLTangentialDecomposedPipeline(StableDiffusionXLPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
 
-        ## Repregentation Guidance specific parameters
-        f_phi: Callable[[torch.Tensor], torch.Tensor] = None,  # Feature extractor
-        V: torch.Tensor = None,  # Representative vectors
-        c: int = 0,  # Class label for which to apply RepG
-        rep_guidance_scale: float = 1.0,  # Scale for RepG
-        distance_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
-        ################################################
-
-        ## Tangential Scailing Guidance specific parameters
-        t_guidance_scale: float = 1.0,  # Scale for TGS
-        r_guidance_scale: float = 1.0,  # Scale for radial guidance
-
-        ## Apply range for each scaling
-        sta_tpd: int = 1000,  # Start step for tangential scaling
-        end_tpd: int = 0,  # End step for tangential scaling
-        # r_start_step: int = 999,  # Start step for radial scaling
-        # r_end_step: int = 0,  # End step for radial scaling
-
-        **kwargs: Any,  # Additional arguments for future compatibility
+        # --- TAG (Tangential Amplifying Guidance) parameters ---
+        t_guidance_scale: float = 1.0,  # scale for the tangential component
+        r_guidance_scale: float = 1.0,  # scale for the radial component
+        sta_tpd: int = 1000,  # TAG is active for timesteps t <= sta_tpd
+        end_tpd: int = 0,     # ... and t >= end_tpd
+        **kwargs: Any,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -252,6 +207,14 @@ class StableDiffusionXLTangentialDecomposedPipeline(StableDiffusionXLPipeline):
                 The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeline class.
+            t_guidance_scale (`float`, *optional*, defaults to 1.0):
+                TAG scale for the tangential component of the sampler update. `1.0` disables TAG.
+            r_guidance_scale (`float`, *optional*, defaults to 1.0):
+                TAG scale for the radial component of the sampler update.
+            sta_tpd (`int`, *optional*, defaults to 1000):
+                Upper end of the timestep window in which TAG is applied (`end_tpd <= t <= sta_tpd`).
+            end_tpd (`int`, *optional*, defaults to 0):
+                Lower end of the timestep window in which TAG is applied.
 
         Examples:
 
@@ -474,32 +437,28 @@ class StableDiffusionXLTangentialDecomposedPipeline(StableDiffusionXLPipeline):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
-
-                # [NOTE] Apply the Tangential Scaling Guidance
                 output = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+                # TAG: decompose the sampler update into radial and tangential parts.
+                # The current latent defines the radial direction v_r; the update
+                # delta = x_{t-1} - x_t is split into its projection onto v_r and the
+                # tangential remainder, which are re-scaled independently.
                 if t <= sta_tpd and t >= end_tpd:
-                    # Apply Tangential Scaling Guidance
-                    post_latents = latents 
-                    v_t_2d       = post_latents / (post_latents.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
+                    prev_latents = latents
+                    v_r = prev_latents / (prev_latents.norm(p=2, dim=(1, 2, 3), keepdim=True) + 1e-8)
 
-                    latents = output 
+                    delta = output - prev_latents
+                    radial_update = (delta * v_r).sum(dim=(1, 2, 3), keepdim=True) * v_r
+                    tangential_update = delta - radial_update
 
-                    delta_latents = latents - post_latents
-                    delta_unit    = (delta_latents * v_t_2d).sum(dim=(1,2,3), keepdim=True)
-
-                    normal_update_vector     = delta_unit * v_t_2d
-                    tangential_update_vector = delta_latents - normal_update_vector
-
-                    eta_v = t_guidance_scale
-                    eta_n = r_guidance_scale
-
-                    latents = post_latents + \
-                        eta_v * tangential_update_vector + \
-                        eta_n * normal_update_vector
-                else: # [NOTE] Simple Path (equal to original)
+                    latents = (
+                        prev_latents
+                        + t_guidance_scale * tangential_update
+                        + r_guidance_scale * radial_update
+                    )
+                else:  # outside the TAG window: plain scheduler update
                     latents = output
 
-                # [NOTE] Apple MPS Bug -- Don't need to care 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
@@ -527,10 +486,6 @@ class StableDiffusionXLTangentialDecomposedPipeline(StableDiffusionXLPipeline):
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
-
-                # [NOTE] Disabled XLA (TPU) support for now 
-                # if XLA_AVAILABLE:
-                #     xm.mark_step()
 
         if not output_type == "latent":
             # make sure the VAE is in float32 mode, as it overflows in float16

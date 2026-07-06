@@ -1,44 +1,26 @@
-from diffusers import StableDiffusion3Pipeline
-
-
-import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-from transformers import (
-    CLIPTextModelWithProjection,
-    CLIPTokenizer,
-    SiglipImageProcessor,
-    SiglipVisionModel,
-    T5EncoderModel,
-    T5TokenizerFast,
-)
 
-from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
-from diffusers.loaders import FromSingleFileMixin, SD3IPAdapterMixin, SD3LoraLoaderMixin
-from diffusers.models.autoencoders import AutoencoderKL
-from diffusers.models.transformers import SD3Transformer2DModel
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.utils import (
-    USE_PEFT_BACKEND,
-    is_torch_xla_available,
-    logging,
-    replace_example_docstring,
-    scale_lora_layers,
-    unscale_lora_layers,
-)
-from diffusers.utils.torch_utils import randn_tensor
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers import StableDiffusion3Pipeline
+from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion_3.pipeline_output import StableDiffusion3PipelineOutput
-
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
-    logger, 
     EXAMPLE_DOC_STRING,
-    calculate_shift, 
+    calculate_shift,
     retrieve_timesteps,
 )
+from diffusers.utils import replace_example_docstring
+
 
 class StableDiffusion3TangentialDecomposedPipeline(StableDiffusion3Pipeline):
+    """Stable Diffusion 3 pipeline with Tangential Amplifying Guidance (TAG).
+
+    At every sampling step the scheduler update `delta = x_{t-1} - x_t` is decomposed
+    into its radial component (along the current latent direction) and the tangential
+    remainder; the two components are re-scaled independently by `r_guidance_scale`
+    and `t_guidance_scale` before being applied.
+    """
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -77,13 +59,11 @@ class StableDiffusion3TangentialDecomposedPipeline(StableDiffusion3Pipeline):
         skip_layer_guidance_start: float = 0.01,
         mu: Optional[float] = None,
 
-        ## Tangential Scailing Guidance specific parameters
-        t_guidance_scale: float = 1.0,  # Scale for TGS
-        r_guidance_scale: float = 1.0,  # Scale for radial guidance
-
-        ## Apply range for each scaling
-        sta_tpd: int = 1000,  # Start step for tangential scaling
-        end_tpd: int = 0,  # End step for tangential scaling
+        # --- TAG (Tangential Amplifying Guidance) parameters ---
+        t_guidance_scale: float = 1.0,  # scale for the tangential component
+        r_guidance_scale: float = 1.0,  # scale for the radial component
+        sta_tpd: int = 1000,  # TAG is active for timesteps t <= sta_tpd
+        end_tpd: int = 0,     # ... and t >= end_tpd
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -191,6 +171,14 @@ class StableDiffusion3TangentialDecomposedPipeline(StableDiffusion3Pipeline):
                 `skip_guidance_layers` from the fraction specified in `skip_layer_guidance_start`. Recommended value by
                 StabiltyAI for Stable Diffusion 3.5 Medium is 0.01.
             mu (`float`, *optional*): `mu` value used for `dynamic_shifting`.
+            t_guidance_scale (`float`, *optional*, defaults to 1.0):
+                TAG scale for the tangential component of the sampler update. `1.0` disables TAG.
+            r_guidance_scale (`float`, *optional*, defaults to 1.0):
+                TAG scale for the radial component of the sampler update.
+            sta_tpd (`int`, *optional*, defaults to 1000):
+                Upper end of the timestep window in which TAG is applied (`end_tpd <= t <= sta_tpd`).
+            end_tpd (`int`, *optional*, defaults to 0):
+                Lower end of the timestep window in which TAG is applied.
 
         Examples:
 
@@ -375,28 +363,27 @@ class StableDiffusion3TangentialDecomposedPipeline(StableDiffusion3Pipeline):
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
                 output = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                # TAG: decompose the sampler update into radial and tangential parts.
+                # The current latent defines the radial direction v_r; the update
+                # delta = x_{t-1} - x_t is split into its projection onto v_r and the
+                # tangential remainder, which are re-scaled independently.
                 if t <= sta_tpd and t >= end_tpd:
-                    post_latents = latents 
-                    v_t_2d       = post_latents / (post_latents.norm(p=2, dim=(1,2,3), keepdim=True) + 1e-8)
+                    prev_latents = latents
+                    v_r = prev_latents / (prev_latents.norm(p=2, dim=(1, 2, 3), keepdim=True) + 1e-8)
 
-                    latents = output 
+                    delta = output - prev_latents
+                    radial_update = (delta * v_r).sum(dim=(1, 2, 3), keepdim=True) * v_r
+                    tangential_update = delta - radial_update
 
-                    delta_latents = latents - post_latents
-                    delta_unit    = (delta_latents * v_t_2d).sum(dim=(1,2,3), keepdim=True)
-
-                    normal_update_vector     = delta_unit * v_t_2d
-                    tangential_update_vector = delta_latents - normal_update_vector
-
-                    eta_v = t_guidance_scale
-                    eta_n = r_guidance_scale
-
-                    latents = post_latents + \
-                        eta_v * tangential_update_vector + \
-                        eta_n * normal_update_vector
-                else: # [NOTE] Simple Path (equal to original)
+                    latents = (
+                        prev_latents
+                        + t_guidance_scale * tangential_update
+                        + r_guidance_scale * radial_update
+                    )
+                else:  # outside the TAG window: plain scheduler update
                     latents = output
 
-                # [NOTE] Apple MPS Bug -- Don't need to care 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
@@ -418,9 +405,6 @@ class StableDiffusion3TangentialDecomposedPipeline(StableDiffusion3Pipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-
-                # if XLA_AVAILABLE:
-                #     xm.mark_step()
 
         if output_type == "latent":
             image = latents

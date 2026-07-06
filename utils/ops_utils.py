@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import time
-import re
 import logging
 from dataclasses import dataclass
-from typing import Literal
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -16,22 +14,13 @@ class GenerationCfg:
     prompt: str = ""
     seed: int = 10838
     cfg_scale: float = 0.0
-    t_lr: float = 1.0
-    r_lr: float = 1.0
+    t_lr: float = 1.0   # tangential scale (t_guidance_scale)
+    r_lr: float = 1.0   # radial scale (r_guidance_scale)
     n_steps: int = 50
-
-@dataclass
-class IOCfg:
-    save_path: str = ""
-    filename_style: Literal["legacy", "smart"] = "smart"
 
 
 def device_string() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
-
-def sanitize_filename(text: str) -> str:
-    text = re.sub(r"\s+", "_", text.strip())
-    return re.sub(r"[^\w\-\.\+_]", "", text)
 
 
 @contextmanager
@@ -79,10 +68,7 @@ def generate(pipe, gen: GenerationCfg, dev: str):
     return out.images[0]
 
 def save_image(img, dest: Path, create_dirs: bool = True) -> Path:
-    """
-    dest: 최종 저장 파일 경로 (파일명 포함)
-    create_dirs: 상위 디렉토리를 필요 시 생성
-    """
+    """Save `img` to `dest` (full file path), creating parent dirs if needed."""
     if create_dirs:
         dest.parent.mkdir(parents=True, exist_ok=True)
     img.save(dest)

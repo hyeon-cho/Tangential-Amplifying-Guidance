@@ -1,30 +1,27 @@
-from diffusers import StableDiffusionPipeline
-import torch
-import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-from packaging import version
-from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 
-from diffusers.utils import (
-    USE_PEFT_BACKEND,
-    deprecate,
-    logging,
-    replace_example_docstring,
-    scale_lora_layers,
-    unscale_lora_layers,
-)
+from diffusers import StableDiffusionPipeline
+from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
+from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
-from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
-from diffusers.callbacks import PipelineCallback, MultiPipelineCallbacks
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
-    retrieve_timesteps, 
-    rescale_noise_cfg, 
-    EXAMPLE_DOC_STRING
+    EXAMPLE_DOC_STRING,
+    rescale_noise_cfg,
+    retrieve_timesteps,
 )
+from diffusers.utils import deprecate, replace_example_docstring
+
 
 class StableDiffusionTangentialDecomposedPipeline(StableDiffusionPipeline):
+    """Stable Diffusion v1/v2 pipeline with Tangential Amplifying Guidance (TAG).
+
+    At every sampling step the scheduler update `delta = x_{t-1} - x_t` is decomposed
+    into its radial component (along the current latent direction) and the tangential
+    remainder; the two components are re-scaled independently by `r_guidance_scale`
+    and `t_guidance_scale` before being applied.
+    """
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -56,15 +53,12 @@ class StableDiffusionTangentialDecomposedPipeline(StableDiffusionPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
 
-        ## Tangential Scailing Guidance specific parameters
-        t_guidance_scale: float = 1.0,  # Scale for TGS
-        r_guidance_scale: float = 1.0,  # Scale for radial guidance
-
-        ## Apply range for each scaling
-        sta_tpd: int = 1000,  # Start step for tangential scaling
-        end_tpd: int = 0,  # End step for tangential scaling
-
-        **kwargs: Any,  # Additional arguments for future compatibility
+        # --- TAG (Tangential Amplifying Guidance) parameters ---
+        t_guidance_scale: float = 1.0,  # scale for the tangential component
+        r_guidance_scale: float = 1.0,  # scale for the radial component
+        sta_tpd: int = 1000,  # TAG is active for timesteps t <= sta_tpd
+        end_tpd: int = 0,     # ... and t >= end_tpd
+        **kwargs: Any,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -141,6 +135,14 @@ class StableDiffusionTangentialDecomposedPipeline(StableDiffusionPipeline):
                 The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeline class.
+            t_guidance_scale (`float`, *optional*, defaults to 1.0):
+                TAG scale for the tangential component of the sampler update. `1.0` disables TAG.
+            r_guidance_scale (`float`, *optional*, defaults to 1.0):
+                TAG scale for the radial component of the sampler update.
+            sta_tpd (`int`, *optional*, defaults to 1000):
+                Upper end of the timestep window in which TAG is applied (`end_tpd <= t <= sta_tpd`).
+            end_tpd (`int`, *optional*, defaults to 0):
+                Lower end of the timestep window in which TAG is applied.
 
         Examples:
 
@@ -305,40 +307,27 @@ class StableDiffusionTangentialDecomposedPipeline(StableDiffusionPipeline):
                 if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
                     noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
 
-                _output = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=True) 
+                # 7.1 TAG: decompose the sampler update into radial and tangential parts.
+                #     The current latent defines the radial direction v_r; the scheduler
+                #     update delta = x_{t-1} - x_t is split into its projection onto v_r
+                #     and the tangential remainder, which are re-scaled independently.
+                _output = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=True)
 
-                # [NOTE] 7.1.1 Get the current step index
-                pred_latent_sample = None
-                # [NOTE] 7.2 Get the unit vector of previous latents
-                post_latents = latents 
-                v_t_2d = post_latents / (post_latents.norm(p=2,dim=(1,2,3), keepdim=True) + 1e-8)  # Normalize v_t_2d
+                prev_latents = latents
+                v_r = prev_latents / (prev_latents.norm(p=2, dim=(1, 2, 3), keepdim=True) + 1e-8)
 
-                # [NOTE] 7.3 Get the latents and predicted latent sample
-                latents            = _output.prev_sample 
-                pred_latent_sample = _output.pred_original_sample if hasattr(_output, 'pred_original_sample') else None
-                del _output
+                latents = _output.prev_sample
+                delta = latents - prev_latents
+                radial_update = (delta * v_r).sum(dim=(1, 2, 3), keepdim=True) * v_r  # [B,1,1,1] * v_r
+                tangential_update = delta - radial_update
 
-                # [NOTE] 7.4 Retrieve the difference of latents
-                delta_latents = latents - post_latents
-                delta_unit    = (delta_latents * v_t_2d).sum(dim=(1,2,3), keepdim=True)  # [B, 1, 1, 1]
-
-                # [NOTE] 7.5 Calculate the normal and tangential update vectors
-                normal_update_vector     = delta_unit * v_t_2d
-                tangential_update_vector = delta_latents - normal_update_vector
-
-                eta_v = t_guidance_scale
-                eta_r = r_guidance_scale
-
-                # [NOTE] 7.6 Apply the tangential and normal updates to the latents
-                if t <= sta_tpd and t >= end_tpd and t_guidance_scale != 1.:
-                    pass
+                # The scales apply only inside the [end_tpd, sta_tpd] timestep window.
+                if t <= sta_tpd and t >= end_tpd and t_guidance_scale != 1.0:
+                    eta_t, eta_r = t_guidance_scale, r_guidance_scale
                 else:
-                    eta_v = 1.0
-                    eta_r = 1.0 
+                    eta_t, eta_r = 1.0, 1.0
 
-                latents = post_latents + \
-                    eta_r * normal_update_vector + \
-                    eta_v * tangential_update_vector
+                latents = prev_latents + eta_r * radial_update + eta_t * tangential_update
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
